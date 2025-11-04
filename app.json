@@ -9,7 +9,18 @@
     "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "infoPlist": {
+        "UIBackgroundModes": [
+          "location",
+          "fetch",
+          "remote-notification"
+        ],
+        "NSLocationWhenInUseUsageDescription": "Sahaaya needs your location to send emergency alerts with your current position.",
+        "NSLocationAlwaysAndWhenInUseUsageDescription": "Sahaaya needs your location to send emergency alerts.",
+        "NSCameraUsageDescription": "This app does not use the camera.",
+        "NSMicrophoneUsageDescription": "This app does not use the microphone."
+      }
     },
     "android": {
       "adaptiveIcon": {
@@ -19,11 +30,31 @@
         "monochromeImage": "./assets/images/android-icon-monochrome.png"
       },
       "edgeToEdgeEnabled": true,
-      "predictiveBackGestureEnabled": false
+      "predictiveBackGestureEnabled": false,
+      "permissions": [
+        "RECEIVE_BOOT_COMPLETED",
+        "VIBRATE",
+        "SCHEDULE_EXACT_ALARM",
+        "USE_EXACT_ALARM",
+        "POST_NOTIFICATIONS",
+        "ACCESS_FINE_LOCATION",
+        "ACCESS_COARSE_LOCATION",
+        "SEND_SMS",
+        "CALL_PHONE",
+        "READ_CONTACTS",
+        "WAKE_LOCK",
+        "FOREGROUND_SERVICE"
+      ],
+      "package": "com.sahaaya.healthcare"
     },
     "web": {
       "output": "static",
       "favicon": "./assets/images/favicon.png"
+    },
+    "notification": {
+      "color": "#4A90E2",
+      "androidMode": "default",
+      "androidCollapsedTitle": "Sahaaya Healthcare"
     },
     "plugins": [
       "expo-router",
@@ -38,7 +69,27 @@
             "backgroundColor": "#000000"
           }
         }
-      ]
+      ],
+      [
+        "expo-notifications",
+        {
+          "icon": "./assets/images/notification-icon.png",
+          "color": "#4A90E2",
+          "sounds": [
+            "./assets/sounds/notification.wav"
+          ],
+          "androidMode": "default",
+          "androidCollapsedTitle": "{{unread_count}} medication reminders"
+        }
+      ],
+      [
+        "expo-location",
+        {
+          "locationAlwaysAndWhenInUsePermission": "Allow Sahaaya to use your location for emergency SOS alerts.",
+          "locationWhenInUsePermission": "Allow Sahaaya to use your location for emergency SOS alerts."
+        }
+      ],
+      "expo-audio"
     ],
     "experiments": {
       "typedRoutes": true,
