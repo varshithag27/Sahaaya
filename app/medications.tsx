@@ -1,21 +1,23 @@
 import React, { useState, useEffect, useRef } from 'react';
 import {
   View, Text, TextInput, TouchableOpacity, StyleSheet,
-  SafeAreaView, ScrollView, Alert, Modal, Platform
+  SafeAreaView, ScrollView, Alert, Modal, Platform, Vibration
 } from 'react-native';
 import { useRouter } from 'expo-router';
-import * as Notifications from 'expo-notifications';
-import { useAudioPlayer } from 'expo-audio';
 import DateTimePicker from '@react-native-community/datetimepicker';
+import * as Notifications from 'expo-notifications';
+import { Audio } from 'expo-av';
 import { getData, saveData } from '../src/services/StorageService';
 import { TRANSLATIONS, COLORS } from '../src/utils/constants';
-import {
-  requestNotificationPermissions,
-  scheduleMedicationReminder,
-  cancelMedicationReminder,
-  snoozeNotification,
-  setupNotificationCategories
-} from '../src/services/NotificationService';
+
+// Configure notifications
+Notifications.setNotificationHandler({
+  handleNotification: async () => ({
+    shouldShowAlert: true,
+    shouldPlaySound: true,
+    shouldSetBadge: true,
+  }),
+});
 
 export default function MedicationsScreen() {
   const [medications, setMedications] = useState([]);
@@ -26,6 +28,8 @@ export default function MedicationsScreen() {
   const [darkMode, setDarkMode] = useState(false);
   const [showTimePicker, setShowTimePicker] = useState(false);
   const [selectedTime, setSelectedTime] = useState(new Date());
+  const [showAlarmModal, setShowAlarmModal] = useState(false);
+  const [currentAlarmMed, setCurrentAlarmMed] = useState(null);
   
   const [formData, setFormData] = useState({
     name: '',
@@ -34,125 +38,188 @@ export default function MedicationsScreen() {
     frequency: 'daily'
   });
 
-  const [alarmPlaying, setAlarmPlaying] = useState(false);
-  const [playingAlarmId, setPlayingAlarmId] = useState(null);
-  
-  // Note: Audio player for alarm sound (works in production APK)
-  // For Expo Go, we rely on system notification sounds
-
+  const soundRef = useRef(null);
+  const vibrationIntervalRef = useRef(null);
   const notificationListener = useRef();
   const responseListener = useRef();
+
   const router = useRouter();
   const t = TRANSLATIONS[language];
   const colors = darkMode ? COLORS.dark : COLORS.light;
 
+  const navigateHome = () => {
+    // Try to navigate to home/index route
+    try {
+      router.push('/'); // or router.replace('/') to prevent going back
+    } catch (error) {
+      router.back(); // Fallback to back navigation
+    }
+  };
+
   useEffect(() => {
     loadSettings();
     loadMedications();
-    initializeNotifications();
-    setupAudio();
+    requestPermissions();
+    setupNotificationListeners();
 
+    return () => {
+      if (notificationListener.current) {
+        Notifications.removeNotificationSubscription(notificationListener.current);
+      }
+      if (responseListener.current) {
+        Notifications.removeNotificationSubscription(responseListener.current);
+      }
+      stopAlarm();
+    };
+  }, []);
+
+  useEffect(() => {
+    // Check for alarms every minute
+    const interval = setInterval(() => {
+      checkForAlarms();
+      resetDailyTakenStatus();
+    }, 60000); // Check every minute
+
+    // Check immediately on mount
+    checkForAlarms();
+    resetDailyTakenStatus();
+
+    return () => clearInterval(interval);
+  }, [medications]);
+
+  const resetDailyTakenStatus = async () => {
+    const today = new Date().toDateString();
+    const lastResetDate = await getData('lastResetDate');
+    
+    if (lastResetDate !== today) {
+      // Reset all medications' taken status
+      const resetMeds = medications.map(med => ({
+        ...med,
+        taken: false,
+        lastTakenDate: med.taken ? new Date().toISOString() : med.lastTakenDate
+      }));
+      
+      await saveData('medications', resetMeds);
+      await saveData('lastResetDate', today);
+      setMedications(resetMeds);
+    }
+  };
+
+  const requestPermissions = async () => {
+    const { status } = await Notifications.requestPermissionsAsync();
+    if (status !== 'granted') {
+      Alert.alert('Permission Required', 'Please enable notifications for medication reminders');
+    }
+  };
+
+  const setupNotificationListeners = () => {
     notificationListener.current = Notifications.addNotificationReceivedListener(notification => {
-      const medicationId = notification.request.content.data?.medicationId;
-      if (medicationId) {
-        playAlarmSound(medicationId);
+      const medId = notification.request.content.data?.medicationId;
+      const med = medications.find(m => m.id === medId);
+      if (med && !med.taken) {
+        triggerAlarm(med);
       }
     });
 
     responseListener.current = Notifications.addNotificationResponseReceivedListener(response => {
-      handleNotificationResponse(response);
+      const medId = response.notification.request.content.data?.medicationId;
+      const action = response.actionIdentifier;
+      
+      if (action === 'taken') {
+        toggleTaken(medId, true);
+      } else if (action === 'snooze') {
+        handleSnooze(medications.find(m => m.id === medId));
+      }
+    });
+  };
+
+  const checkForAlarms = () => {
+    const now = new Date();
+    const currentTime = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`;
+    
+    medications.forEach(med => {
+      if (med.time === currentTime && !med.taken && currentAlarmMed?.id !== med.id) {
+        triggerAlarm(med);
+      }
+    });
+  };
+
+  const triggerAlarm = async (med) => {
+    setCurrentAlarmMed(med);
+    setShowAlarmModal(true);
+    
+    // Start continuous vibration
+    const VIBRATION_PATTERN = [0, 500, 500];
+    vibrationIntervalRef.current = setInterval(() => {
+      Vibration.vibrate(VIBRATION_PATTERN);
+    }, 1000);
+
+    // Play alarm sound (optional - works better in built APK)
+    try {
+      const { sound } = await Audio.Sound.createAsync(
+        // Use a default system sound or add your own alarm.mp3 to assets
+        { uri: 'https://www.soundjay.com/phone/sounds/phone-calling-1.mp3' },
+        { shouldPlay: true, isLooping: true, volume: 1.0 }
+      );
+      soundRef.current = sound;
+    } catch (error) {
+      console.log('Sound not available, using vibration only');
+    }
+  };
+
+  const stopAlarm = async () => {
+    // Stop vibration
+    Vibration.cancel();
+    if (vibrationIntervalRef.current) {
+      clearInterval(vibrationIntervalRef.current);
+      vibrationIntervalRef.current = null;
+    }
+
+    // Stop sound
+    if (soundRef.current) {
+      try {
+        await soundRef.current.stopAsync();
+        await soundRef.current.unloadAsync();
+        soundRef.current = null;
+      } catch (error) {
+        console.log('Error stopping sound:', error);
+      }
+    }
+
+    setShowAlarmModal(false);
+    setCurrentAlarmMed(null);
+  };
+
+  const scheduleNotification = async (medication) => {
+    const [hours, minutes] = medication.time.split(':');
+    
+    const trigger = {
+      hour: parseInt(hours),
+      minute: parseInt(minutes),
+      repeats: true,
+    };
+
+    const notificationId = await Notifications.scheduleNotificationAsync({
+      content: {
+        title: '💊 Medicine Reminder',
+        body: `Time to take ${medication.name} - ${medication.dosage}`,
+        sound: true,
+        priority: Notifications.AndroidNotificationPriority.HIGH,
+        data: { medicationId: medication.id },
+      },
+      trigger,
     });
 
-    return () => {
-      Notifications.removeNotificationSubscription(notificationListener.current);
-      Notifications.removeNotificationSubscription(responseListener.current);
-      if (alarmSound) {
-        alarmSound.unloadAsync();
-      }
-    };
-  }, []);
-
-  const setupAudio = async () => {
-    try {
-      await Audio.setAudioModeAsync({
-        allowsRecordingIOS: false,
-        playsInSilentModeIOS: true,
-        staysActiveInBackground: true,
-        shouldDuckAndroid: true,
-      });
-    } catch (error) {
-      console.log('Audio setup error:', error);
-    }
+    return notificationId;
   };
 
-  const playAlarmSound = async (medicationId) => {
+  const cancelNotification = async (notificationId) => {
     try {
-      if (alarmSound) {
-        await alarmSound.unloadAsync();
-      }
-
-      const { sound } = await Audio.Sound.createAsync(
-        require('../../assets/sounds/alarm.mp3'), // We'll create this
-        { 
-          isLooping: true,
-          shouldPlay: true,
-          volume: 1.0,
-        }
-      );
-      
-      setAlarmSound(sound);
-      setPlayingAlarmId(medicationId);
-      await sound.playAsync();
-    } catch (error) {
-      console.log('Sound play error:', error);
-      // Fallback to system notification sound
-    }
-  };
-
-  const stopAlarmSound = async () => {
-    try {
-      if (alarmSound) {
-        await alarmSound.stopAsync();
-        await alarmSound.unloadAsync();
-        setAlarmSound(null);
-        setPlayingAlarmId(null);
+      if (notificationId) {
+        await Notifications.cancelScheduledNotificationAsync(notificationId);
       }
     } catch (error) {
-      console.log('Stop sound error:', error);
-    }
-  };
-
-  const initializeNotifications = async () => {
-    const hasPermission = await requestNotificationPermissions();
-    if (hasPermission) {
-      await setupNotificationCategories();
-    } else {
-      Alert.alert(
-        'Permissions Required',
-        'Please enable notifications to receive medication reminders',
-        [{ text: 'OK' }]
-      );
-    }
-  };
-
-  const handleNotificationResponse = async (response) => {
-    const { actionIdentifier, notification } = response;
-    const medicationId = notification.request.content.data?.medicationId;
-    const medicationName = notification.request.content.data?.medicationName;
-
-    if (actionIdentifier === 'taken') {
-      await stopAlarmSound();
-      await toggleTaken(medicationId, true);
-      Alert.alert('✓ Marked as Taken', `${medicationName} marked as taken`);
-    } else if (actionIdentifier === 'snooze') {
-      await stopAlarmSound();
-      const med = medications.find(m => m.id === medicationId);
-      if (med) {
-        await snoozeNotification(med);
-        Alert.alert('⏰ Snoozed', `Reminder set for 10 minutes`);
-      }
-    } else if (actionIdentifier === 'dismiss') {
-      await stopAlarmSound();
+      console.log('Error canceling notification:', error);
     }
   };
 
@@ -191,67 +258,84 @@ export default function MedicationsScreen() {
       id: editingId || Date.now().toString(),
       ...formData,
       taken: false,
-      createdAt: new Date().toISOString()
+      createdAt: new Date().toISOString(),
+      notificationId: null
     };
 
     let updatedMeds;
     if (editingId) {
+      const oldMed = medications.find(m => m.id === editingId);
+      if (oldMed?.notificationId) {
+        await cancelNotification(oldMed.notificationId);
+      }
       updatedMeds = medications.map(m => m.id === editingId ? newMed : m);
     } else {
       updatedMeds = [...medications, newMed];
     }
 
+    // Schedule notification
+    const notificationId = await scheduleNotification(newMed);
+    newMed.notificationId = notificationId;
+    
+    // Update with notification ID
+    updatedMeds = updatedMeds.map(m => m.id === newMed.id ? newMed : m);
+
     await saveData('medications', updatedMeds);
     setMedications(updatedMeds);
     
-    const notificationId = await scheduleMedicationReminder(newMed);
-    if (notificationId) {
-      Alert.alert(
-        '✓ ' + t.medicationAdded,
-        `Alarm set for ${formData.time} daily. Sound will play until you mark as taken.`
-      );
-    } else {
-      Alert.alert(
-        t.medicationAdded,
-        'Note: Build APK for full alarm functionality with persistent sound.'
-      );
-    }
+    Alert.alert(
+      '✓ ' + (editingId ? 'Updated' : t.medicationAdded),
+      `Alarm set for ${formData.time} daily with vibration.`
+    );
     
     resetForm();
   };
 
   const toggleTaken = async (id, takenStatus = null) => {
-    await stopAlarmSound();
+    stopAlarm();
     
     const updated = medications.map(m => {
       if (m.id === id) {
         const newTakenStatus = takenStatus !== null ? takenStatus : !m.taken;
-        return { ...m, taken: newTakenStatus };
+        return { 
+          ...m, 
+          taken: newTakenStatus,
+          lastTakenTime: newTakenStatus ? new Date().toISOString() : m.lastTakenTime
+        };
       }
       return m;
     });
+    
     await saveData('medications', updated);
     setMedications(updated);
+
+    if (takenStatus) {
+      // Brief success feedback
+      Alert.alert('✓ Done', 'Medication marked as taken for today', [
+        { text: 'OK' }
+      ]);
+    }
   };
 
   const handleDelete = async (id) => {
     setShowMenuId(null);
     Alert.alert(
       t.delete,
-      t.deleteMedication,
+      'Delete this medication and its alarm?',
       [
         { text: t.cancel, style: 'cancel' },
         {
           text: t.delete,
           style: 'destructive',
           onPress: async () => {
-            await cancelMedicationReminder(id);
-            await stopAlarmSound();
+            const medication = medications.find(m => m.id === id);
+            if (medication?.notificationId) {
+              await cancelNotification(medication.notificationId);
+            }
             
             const updated = medications.filter(m => m.id !== id);
             await saveData('medications', updated);
             setMedications(updated);
-            Alert.alert('Deleted', 'Medication and alarms removed');
           }
         }
       ]
@@ -277,9 +361,23 @@ export default function MedicationsScreen() {
   };
 
   const handleSnooze = async (med) => {
-    await stopAlarmSound();
-    await snoozeNotification(med);
-    Alert.alert('⏰ Snoozed', 'Alarm will ring again in 10 minutes');
+    stopAlarm();
+    
+    // Schedule notification for 10 minutes later
+    await Notifications.scheduleNotificationAsync({
+      content: {
+        title: '💊 Medicine Reminder (Snoozed)',
+        body: `Time to take ${med.name} - ${med.dosage}`,
+        sound: true,
+        priority: Notifications.AndroidNotificationPriority.HIGH,
+        data: { medicationId: med.id },
+      },
+      trigger: {
+        seconds: 600, // 10 minutes
+      },
+    });
+    
+    Alert.alert('⏰ Snoozed', 'Reminder snoozed for 10 minutes');
   };
 
   const resetForm = () => {
@@ -293,7 +391,7 @@ export default function MedicationsScreen() {
     <SafeAreaView style={[styles.container, { backgroundColor: colors.background }]}>
       <View style={styles.header}>
         <TouchableOpacity onPress={() => router.back()}>
-          <Text style={[styles.backBtn, { color: colors.primary }]}>← {t.home}</Text>
+          <Text style={[styles.backBtn, { color: colors.primary }]}>← {t.home || 'Home'}</Text>
         </TouchableOpacity>
         <Text style={[styles.title, { color: colors.text }]}>💊 {t.medications}</Text>
       </View>
@@ -315,27 +413,34 @@ export default function MedicationsScreen() {
               styles.card, 
               { 
                 backgroundColor: colors.card,
-                borderWidth: playingAlarmId === med.id ? 3 : 0,
-                borderColor: playingAlarmId === med.id ? colors.danger : 'transparent'
+                opacity: med.taken ? 0.7 : 1
               }
             ]}>
-              {playingAlarmId === med.id && (
-                <View style={[styles.alarmBanner, { backgroundColor: colors.danger }]}>
-                  <Text style={styles.alarmBannerText}>🔔 ALARM RINGING!</Text>
+              {med.taken && (
+                <View style={[styles.takenBadge, { backgroundColor: colors.success }]}>
+                  <Text style={styles.takenBadgeText}>✓ Taken Today</Text>
                 </View>
               )}
               
               <View style={styles.cardHeader}>
                 <View style={styles.cardContent}>
-                  <Text style={[styles.medName, { color: colors.text }]}>{med.name}</Text>
+                  <Text style={[
+                    styles.medName, 
+                    { 
+                      color: colors.text,
+                      textDecorationLine: med.taken ? 'line-through' : 'none'
+                    }
+                  ]}>
+                    {med.name}
+                  </Text>
                   <Text style={[styles.medDetail, { color: colors.text }]}>
                     💊 {med.dosage}
                   </Text>
                   <Text style={[styles.medDetail, { color: colors.text }]}>
-                    🕐 {med.time} • {med.frequency}
+                    🕐 {med.time} • {t[med.frequency] || med.frequency}
                   </Text>
                   <Text style={[styles.alarmText, { color: colors.primary }]}>
-                    🔔 Alarm set • Sound till marked taken
+                    🔔 Alarm {med.taken ? 'completed' : 'active'} for {med.time}
                   </Text>
                 </View>
 
@@ -373,23 +478,14 @@ export default function MedicationsScreen() {
                 <TouchableOpacity
                   style={[
                     styles.takenButton,
-                    { backgroundColor: med.taken ? colors.success : colors.danger }
+                    { backgroundColor: med.taken ? colors.success : colors.primary }
                   ]}
                   onPress={() => toggleTaken(med.id)}
                 >
                   <Text style={styles.takenText}>
-                    {med.taken ? '✓ Taken' : '○ Mark as Taken'}
+                    {med.taken ? '✓ Taken Today' : '○ Mark as Taken'}
                   </Text>
                 </TouchableOpacity>
-
-                {!med.taken && (
-                  <TouchableOpacity
-                    style={[styles.snoozeButton, { backgroundColor: colors.warning }]}
-                    onPress={() => handleSnooze(med)}
-                  >
-                    <Text style={styles.snoozeText}>⏰ Snooze</Text>
-                  </TouchableOpacity>
-                )}
               </View>
             </View>
           ))
@@ -403,6 +499,7 @@ export default function MedicationsScreen() {
         <Text style={styles.fabText}>+ {t.addMedication}</Text>
       </TouchableOpacity>
 
+      {/* Add/Edit Medication Modal */}
       <Modal visible={showModal} animationType="slide" transparent>
         <View style={styles.modalOverlay}>
           <View style={[styles.modalContent, { backgroundColor: colors.background }]}>
@@ -412,7 +509,7 @@ export default function MedicationsScreen() {
 
             <TextInput
               style={[styles.input, { backgroundColor: colors.card, color: colors.text }]}
-              placeholder={t.medicineName}
+              placeholder={t.medicineName || "Medicine Name"}
               placeholderTextColor={colors.border}
               value={formData.name}
               onChangeText={(text) => setFormData({...formData, name: text})}
@@ -420,7 +517,7 @@ export default function MedicationsScreen() {
 
             <TextInput
               style={[styles.input, { backgroundColor: colors.card, color: colors.text }]}
-              placeholder={t.dosage + ' (e.g., 500mg, 2 tablets)'}
+              placeholder={(t.dosage || "Dosage") + ' (e.g., 500mg, 2 tablets)'}
               placeholderTextColor={colors.border}
               value={formData.dosage}
               onChangeText={(text) => setFormData({...formData, dosage: text})}
@@ -463,7 +560,7 @@ export default function MedicationsScreen() {
                   <Text style={[styles.freqText, { 
                     color: formData.frequency === freq ? '#FFF' : colors.text 
                   }]}>
-                    {t[freq]}
+                    {t[freq] || freq}
                   </Text>
                 </TouchableOpacity>
               ))}
@@ -471,7 +568,7 @@ export default function MedicationsScreen() {
 
             <View style={[styles.noteBox, { backgroundColor: colors.card }]}>
               <Text style={[styles.noteText, { color: colors.text }]}>
-                ℹ️ Alarm will ring continuously until you press "Mark as Taken"
+                ℹ️ Alarm will ring with vibration at scheduled time. Status resets daily at midnight.
               </Text>
             </View>
 
@@ -480,13 +577,47 @@ export default function MedicationsScreen() {
                 style={[styles.modalBtn, { backgroundColor: colors.border }]}
                 onPress={resetForm}
               >
-                <Text style={styles.modalBtnText}>{t.cancel}</Text>
+                <Text style={styles.modalBtnText}>{t.cancel || 'Cancel'}</Text>
               </TouchableOpacity>
               <TouchableOpacity
                 style={[styles.modalBtn, { backgroundColor: colors.success }]}
                 onPress={handleSave}
               >
-                <Text style={styles.modalBtnText}>{t.save}</Text>
+                <Text style={styles.modalBtnText}>{t.save || 'Save'}</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      {/* Full Screen Alarm Modal */}
+      <Modal visible={showAlarmModal} animationType="fade" transparent={false}>
+        <View style={[styles.alarmFullScreen, { backgroundColor: colors.danger }]}>
+          <View style={styles.alarmContent}>
+            <Text style={styles.alarmIcon}>🔔</Text>
+            <Text style={styles.alarmTitle}>MEDICINE REMINDER!</Text>
+            
+            {currentAlarmMed && (
+              <>
+                <Text style={styles.alarmMedName}>{currentAlarmMed.name}</Text>
+                <Text style={styles.alarmDosage}>{currentAlarmMed.dosage}</Text>
+                <Text style={styles.alarmTime}>Scheduled: {currentAlarmMed.time}</Text>
+              </>
+            )}
+
+            <View style={styles.alarmButtons}>
+              <TouchableOpacity
+                style={[styles.alarmActionBtn, { backgroundColor: colors.success }]}
+                onPress={() => currentAlarmMed && toggleTaken(currentAlarmMed.id, true)}
+              >
+                <Text style={styles.alarmActionText}>✓ TAKEN</Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={[styles.alarmActionBtn, { backgroundColor: '#FF9500' }]}
+                onPress={() => currentAlarmMed && handleSnooze(currentAlarmMed)}
+              >
+                <Text style={styles.alarmActionText}>⏰ SNOOZE 10 MIN</Text>
               </TouchableOpacity>
             </View>
           </View>
@@ -516,15 +647,18 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.1,
     shadowRadius: 4,
   },
-  alarmBanner: {
-    marginBottom: 15,
-    padding: 12,
-    borderRadius: 10,
-    alignItems: 'center',
+  takenBadge: {
+    position: 'absolute',
+    top: 10,
+    right: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 20,
+    zIndex: 1,
   },
-  alarmBannerText: {
+  takenBadgeText: {
     color: '#FFF',
-    fontSize: 18,
+    fontSize: 12,
     fontWeight: 'bold',
   },
   cardHeader: { 
@@ -558,19 +692,12 @@ const styles = StyleSheet.create({
   dropdownDivider: { height: 1, marginHorizontal: 10 },
   actionButtons: { flexDirection: 'row', gap: 10 },
   takenButton: {
-    flex: 2,
-    padding: 15,
-    borderRadius: 10,
-    alignItems: 'center',
-  },
-  takenText: { color: '#FFF', fontSize: 18, fontWeight: 'bold' },
-  snoozeButton: {
     flex: 1,
     padding: 15,
     borderRadius: 10,
     alignItems: 'center',
   },
-  snoozeText: { color: '#FFF', fontSize: 16, fontWeight: 'bold' },
+  takenText: { color: '#FFF', fontSize: 18, fontWeight: 'bold' },
   fab: { 
     position: 'absolute', 
     bottom: 30, 
@@ -613,4 +740,60 @@ const styles = StyleSheet.create({
   modalActions: { flexDirection: 'row', justifyContent: 'space-between', gap: 10 },
   modalBtn: { flex: 1, padding: 18, borderRadius: 12, alignItems: 'center' },
   modalBtnText: { color: '#FFF', fontSize: 20, fontWeight: 'bold' },
+  
+  // Full Screen Alarm Styles
+  alarmFullScreen: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: 20,
+  },
+  alarmContent: {
+    alignItems: 'center',
+    width: '100%',
+  },
+  alarmIcon: {
+    fontSize: 120,
+    marginBottom: 30,
+  },
+  alarmTitle: {
+    fontSize: 36,
+    fontWeight: 'bold',
+    color: '#FFF',
+    marginBottom: 40,
+    textAlign: 'center',
+  },
+  alarmMedName: {
+    fontSize: 32,
+    fontWeight: 'bold',
+    color: '#FFF',
+    marginBottom: 10,
+    textAlign: 'center',
+  },
+  alarmDosage: {
+    fontSize: 24,
+    color: '#FFF',
+    marginBottom: 10,
+    textAlign: 'center',
+  },
+  alarmTime: {
+    fontSize: 20,
+    color: '#FFF',
+    marginBottom: 50,
+    textAlign: 'center',
+  },
+  alarmButtons: {
+    width: '100%',
+    gap: 20,
+  },
+  alarmActionBtn: {
+    padding: 25,
+    borderRadius: 15,
+    alignItems: 'center',
+  },
+  alarmActionText: {
+    color: '#FFF',
+    fontSize: 26,
+    fontWeight: 'bold',
+  },
 });
